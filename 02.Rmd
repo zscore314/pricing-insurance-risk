@@ -1,0 +1,204 @@
+---
+title: "Chapter 02. The Insurance Market and Our Case Studies"
+author: "Zach Eisenstein"
+date: "`r format(Sys.Date())`"
+output: html_notebook
+---
+
+To Do:
+
+- remove dependencies to internal formatting (AonECM, AonAltair)
+
+
+```{r, warning = F, message = F}
+library(tidyverse)
+library(flextable)
+theme_set(theme_light())
+```
+
+## 2.4.1 The Simple Discrete Example
+
+Though this discrete example does not appear to be used much throughout the book. Let's warm up a bit by inputting and getting some basic statistics.
+
+
+```{r}
+x1 <- tibble(x1_gross = c(0, 8, 10),
+             x1_net = c(0, 8, 10),
+             px1 = c(.5, .25, .25))
+```
+
+
+X2 has reinsurance applied that caps losses at 20.
+
+```{r}
+x2 <- tibble(x2_gross = c(0, 1, 90),
+             x2_net = c(0, 1, 20),
+             px2 = c(.5, .25, .25))
+```
+
+We'll bring the distributions together using the `crossing` function and multiply probabilities (due to independence assumption).
+
+```{r}
+x_total <- crossing(x1, x2) %>%
+  mutate(total_gross = x1_gross + x2_gross,
+         total_net = x1_net + x2_net,
+         p = px1 * px2) %>%
+  select(-px1, -px2)
+
+x_total
+```
+
+Let's plot the distributions
+
+```{r}
+x_total %>%
+  pivot_longer(-p,names_to = c("Line", "GN"), names_sep = "_") %>%
+  ggplot(aes(value, p)) +
+  geom_col() +
+  facet_grid(GN ~ Line)
+```
+
+...and calculate summary statistics.
+
+We'll use a helper function for this.
+
+```{r}
+discrete_sum <- function(x, p){
+  
+  .moment <- function(x, p, k = 1) {
+    
+    m = sum(x * p)
+    sum((x - m) ^ k * p)
+  }
+  
+  tibble(Mean = sum(x * p),
+         CV = (.moment(x, p, 2) ^ .5) / Mean,
+         Skewness = .moment(x, p, 3) / .moment(x, p , 2) ^ (3/2),
+         Kurtosis = .moment(x, p, 4) / .moment(x, p , 2) ^ 2 - 3
+  )
+  
+  
+}
+```
+
+
+```{r}
+x_total %>%
+  pivot_longer(-p,names_to = c("Line", "GN"), names_sep = "_") %>%
+  group_by(GN, Line) %>%
+  nest() %>%
+  summarise(s = map(data, ~ discrete_sum(.x$value, .x$p))) %>%
+  ungroup() %>%
+  unnest(s) %>%
+  pivot_longer(Mean:Kurtosis, names_to = "Statistic") %>%
+  mutate(Line = factor(Line, levels = c('x1', 'x2', 'total'))) %>%
+  arrange(GN, Line) %>%
+  pivot_wider(names_from = c(GN, Line)) %>%
+  mutate_if(is.numeric, ~ round(., 3)) %>%
+  flextable::flextable() %>%
+  flextable::set_header_labels(Statistics = "Statistic",
+                               gross_total = "Total",
+                               gross_x1 = "X1",
+                               gross_x2 = "X2",
+                               net_total = "Total",
+                               net_x1 = "X1",
+                               net_x2 = "X2") %>%
+  flextable::add_header_row(
+    values = c("","Gross", "Net"),
+    colwidths = c(1, 3, 3)) %>%
+  AonECM::ft_theme_aon() %>%
+  AonECM::add_title_header("Table 2.3")
+  # flextable::align(align = "left", part = "header") %>%
+  # add_header_lines("Table 2.3") %>%
+  # fontsize(i = 1, size = 14, part = "header") %>%
+  # flextable::border(i = 1, border.top = officer::fp_border(color = "transparent"))
+```
+
+If we wanted to sample from the discrete distribution we could use `replicate` or `slice_sample`
+
+```{r}
+
+x_total %>% 
+  slice_sample(n = 1e3, weight_by = p, replace = T) %>%
+  select(-p)
+```
+
+## 2.4.2 Tame Case Study
+
+For this case study we have two units, A & B that are each [gamma](https://en.wikipedia.org/wiki/Gamma_distribution) distributed with mean 50 and CV 10% and 15% respectively. 
+The first step is to express these assumptions as parameters to the gamma distribution
+
+With shape parameter $\alpha$ and scale $\sigma$, the mean and variance are $E[X] = \alpha  \sigma$ and $Var[X] = \alpha\sigma^{2}$
+
+This implies that $\alpha = \frac{1}{CV[X]^{2}}$ and $\sigma = E[X]CV[X]^{2}$ or $\sigma = \frac{E[X]}{\alpha}$
+
+When using the `rate` instead of `scale`, we'd simply use $\frac{1}{\sigma}$
+
+```{r}
+
+tame <- tribble(
+  ~ Case, ~ Unit, ~ Distribution, ~ Mean, ~ CV,
+  
+  "Tame", "A", "Gamma", 50, .1,
+  "Tame", "B", "Gamma", 50, .15
+) %>%
+  mutate(alpha = 1 / cv^2) %>%
+  mutate(rate = alpha / Mean)
+
+tame %>%
+  mutate(across(c(alpha, rate), ~ round(., 3))) %>%
+  flextable
+
+```
+Let's run a simulation
+
+```{r}
+sims <- tame %>%
+  crossing(trial = 1:10e3) %>%
+  mutate(value = rgamma(n(), alpha, rate)) %>%
+  select(trial, Unit, value) %>%
+  pivot_wider(names_from = Unit) %>%
+  mutate(Total = A + B)
+
+# add reinsurance on B
+sims <- sims %>%
+  rename_with(~ paste0(., "_Gross"), .cols = -trial) %>%
+  mutate(A_Net = A_Gross) %>%
+  mutate(B_Net = B_Gross - pmin(13, pmax(B_Gross - 56, 0))) %>%
+  mutate(Total_Net = A_Net + B_Net)
+  
+```
+
+
+```{r}
+sims %>%
+  select(-trial) %>%
+  summarise_all(list(Mean = mean,
+            CV = ~ sd(.) / mean(.),
+            Skewness = moments::skewness,
+            Kurtosis = ~ moments::kurtosis(.) - 3)) %>%
+  pivot_longer(everything(), names_to = c("Line", "GN", "Statistic"), names_sep = "_") %>%
+  pivot_wider(names_from = c(GN, Line))
+```
+
+
+Let's take a look at the densities
+
+```{r}
+
+tame %>%
+  select(Unit, alpha, rate) %>%
+  crossing(x = seq(0, 200, length.out = 101)) %>%
+  mutate(d = dgamma(x, alpha, rate)) %>%
+  mutate(d = log(d)) %>%
+  ggplot(aes(x, d, color = Unit)) +
+  geom_line()
+  # scale_x_log10()
+  scale_y_log10()
+
+ggplot(data = data.frame(x = c(0, 200)), aes(x)) +
+  stat_function(fun = dgamma, n = 101, args = list(shape = tame$Mean[1], rate = tame$rate[1])) + ylab("") +
+  scale_y_continuous(breaks = NULL)
+
+```
+
