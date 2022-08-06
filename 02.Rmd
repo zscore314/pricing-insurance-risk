@@ -3,6 +3,8 @@ title: "Chapter 02. The Insurance Market and Our Case Studies"
 author: "Zach Eisenstein"
 date: "`r format(Sys.Date())`"
 output: html_notebook
+editor_options: 
+  chunk_output_type: console
 ---
 
 To Do:
@@ -18,7 +20,7 @@ theme_set(theme_light())
 
 ## 2.4.1 The Simple Discrete Example
 
-Though this discrete example does not appear to be used much throughout the book. Let's warm up a bit by inputting and getting some basic statistics.
+We start with a simple discrete distribution on a two unit portfolio Let's warm up a bit by inputting and getting some basic statistics.
 
 
 ```{r}
@@ -81,6 +83,7 @@ discrete_sum <- function(x, p){
 }
 ```
 
+These figures align with Table 2.3 (p19)
 
 ```{r}
 x_total %>%
@@ -125,6 +128,8 @@ x_total %>%
 
 ## 2.4.2 Tame Case Study
 
+> In the Tame Case Study, Ins Co. write two predictable units with no catastrophe exposure. We include it to demonstrate an idealized risk-pool: it represents the best case--from Ins Co.'s perspective. It could proxy a portfolio of personal and commercial auto liability. 
+
 For this case study we have two units, A & B that are each [gamma](https://en.wikipedia.org/wiki/Gamma_distribution) distributed with mean 50 and CV 10% and 15% respectively. 
 The first step is to express these assumptions as parameters to the gamma distribution
 
@@ -137,24 +142,38 @@ When using the `rate` instead of `scale`, we'd simply use $\frac{1}{\sigma}$
 ```{r}
 
 tame <- tribble(
-  ~ Case, ~ Unit, ~ Distribution, ~ Mean, ~ CV,
-  
-  "Tame", "A", "Gamma", 50, .1,
-  "Tame", "B", "Gamma", 50, .15
+  ~ Unit, ~ Distribution, ~ Mean, ~ CV,
+  "A", "Gamma", 50, .1,
+  "B", "Gamma", 50, .15
 ) %>%
-  mutate(alpha = 1 / cv^2) %>%
+  mutate(alpha = 1 / CV^2) %>%
   mutate(rate = alpha / Mean)
 
 tame %>%
   mutate(across(c(alpha, rate), ~ round(., 3))) %>%
-  flextable
+  knitr::kable(caption = "Tame Case Study Parameters")
+
 
 ```
+It's noted that aggregate reinsurance is applied to B with an attachment probability of 0.2 and exhaust of .01. 
+Let's calculate the precise limit and attachments
+
+```{r}
+tame_ri <- tibble(unit = "B",
+                  attach = qgamma(1 - .2, tame$alpha[2], tame$rate[2]),
+                  exhaust = qgamma(1 - .01, tame$alpha[2], tame$rate[2]),
+                  limit = exhaust - attach)
+tame_ri
+```
+
+
+
+
 Let's run a simulation
 
 ```{r}
 sims <- tame %>%
-  crossing(trial = 1:10e3) %>%
+  crossing(trial = 1:1e6) %>%
   mutate(value = rgamma(n(), alpha, rate)) %>%
   select(trial, Unit, value) %>%
   pivot_wider(names_from = Unit) %>%
@@ -164,11 +183,13 @@ sims <- tame %>%
 sims <- sims %>%
   rename_with(~ paste0(., "_Gross"), .cols = -trial) %>%
   mutate(A_Net = A_Gross) %>%
-  mutate(B_Net = B_Gross - pmin(13, pmax(B_Gross - 56, 0))) %>%
+  mutate(B_Net = B_Gross - pmin(tame_ri$limit, pmax(B_Gross - tame_ri$attach, 0))) %>%
   mutate(Total_Net = A_Net + B_Net)
   
+head(sims)
 ```
 
+The results should be comparable to Table 2.5 (p20), but will differ due to simulation error
 
 ```{r}
 sims %>%
@@ -178,7 +199,48 @@ sims %>%
             Skewness = moments::skewness,
             Kurtosis = ~ moments::kurtosis(.) - 3)) %>%
   pivot_longer(everything(), names_to = c("Line", "GN", "Statistic"), names_sep = "_") %>%
-  pivot_wider(names_from = c(GN, Line))
+  pivot_wider(names_from = c(GN, Line)) %>%
+  mutate(across(is.numeric, ~ round(., 3)))
+```
+
+
+We could use Fast Fourier Transform as Mildenhall does. 
+> The FFT approximation is essentially exact and it is used for all graphics and illustrations. 
+
+
+```{r}
+buckets <- 2^18
+pml <- 200 # maximum of discretized distribution
+step_size <- pml / buckets
+
+tame_fft <- tibble(start = 0:(buckets-1) * step_size,
+       mid = start + step_size / 2) %>%
+  mutate(A = pgamma(mid, tame$alpha[1], tame$rate[1])) %>%
+  mutate(B = pgamma(mid, tame$alpha[2], tame$rate[2])) %>%
+  
+  # differences of Fx
+  mutate(across(c(A, B), ~if_else(row_number() == 1, ., . - lag(.)))) %>%
+  
+  # Aggregate approximation from FFT
+  mutate(Total = Re(fft(fft(A) * fft(B), inverse = T)) / buckets)
+  
+tame_fft
+
+tame_fft %>%
+  select(-start) %>%
+  pivot_longer(-mid) %>%
+  group_by(name) %>%
+  summarise(discrete_sum(mid, value)) %>%
+  pivot_longer(-name, names_to = "Statistic") %>%
+  pivot_wider() %>%
+  mutate(across(is.numeric, ~ round(., 3)))
+
+```
+
+Attempt at making CDF of B Net
+```{r}
+tame_fft
+
 ```
 
 
@@ -188,13 +250,10 @@ Let's take a look at the densities
 
 tame %>%
   select(Unit, alpha, rate) %>%
-  crossing(x = seq(0, 200, length.out = 101)) %>%
-  mutate(d = dgamma(x, alpha, rate)) %>%
-  mutate(d = log(d)) %>%
+  crossing(x = seq(0, 200, length.out = 100)) %>%
+  mutate(d = dgamma(x, alpha, rate, log = F)) %>%
   ggplot(aes(x, d, color = Unit)) +
   geom_line()
-  # scale_x_log10()
-  scale_y_log10()
 
 ggplot(data = data.frame(x = c(0, 200)), aes(x)) +
   stat_function(fun = dgamma, n = 101, args = list(shape = tame$Mean[1], rate = tame$rate[1])) + ylab("") +
